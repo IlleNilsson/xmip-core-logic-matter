@@ -5,7 +5,13 @@
 //! container holds elements until an end-of-container byte. Every number is
 //! little-endian. An [`Element`] here is a tag and a [`Value`]; [`encode`]
 //! writes one and [`decode`] reads one back, refusing anything malformed with
-//! the byte offset where it stopped.
+//! the byte offset where it stopped. Bytes are read over codec's cursor and
+//! written with its writer; what a control byte, a tag and a length mean is
+//! Matter's, here.
+
+use codec::CodecError;
+use codec::cursor::Cursor;
+use codec::writer::ByteWriter;
 
 /// Where an element's tag comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,12 +144,14 @@ pub fn encode(element: &Element) -> Vec<u8> {
 /// The bytes end inside an element, open a container they never close, use an
 /// element type the specification does not define, or go on past the element.
 pub fn decode(bytes: &[u8]) -> Result<Element, TlvError> {
-    let mut reader = Reader { bytes, at: 0 };
-    let element = reader
-        .element()?
+    let mut cursor = Cursor::new(bytes);
+    let element = element(&mut cursor)?
         .ok_or_else(|| TlvError::new(0, "an end-of-container opens the bytes"))?;
-    if reader.at != bytes.len() {
-        return Err(TlvError::new(reader.at, "bytes continue past the element"));
+    if !cursor.is_empty() {
+        return Err(TlvError::new(
+            cursor.position(),
+            "bytes continue past the element",
+        ));
     }
     Ok(element)
 }
@@ -159,11 +167,11 @@ fn write(element: &Element, out: &mut Vec<u8>) {
         Value::Bool(false) => 0x08,
         Value::Bool(true) => 0x09,
         Value::Float(f) => {
-            out.extend_from_slice(&f.to_le_bytes());
+            out.f32_le(*f);
             0x0A
         }
         Value::Double(f) => {
-            out.extend_from_slice(&f.to_le_bytes());
+            out.f64_le(*f);
             0x0B
         }
         Value::Utf8(text) => 0x0C + write_length(text.as_bytes(), out),
@@ -235,13 +243,13 @@ fn write_length(bytes: &[u8], out: &mut Vec<u8>) -> u8 {
         out.push(v);
         0
     } else if let Ok(v) = u16::try_from(length) {
-        out.extend_from_slice(&v.to_le_bytes());
+        out.u16_le(v);
         1
     } else if let Ok(v) = u32::try_from(length) {
-        out.extend_from_slice(&v.to_le_bytes());
+        out.u32_le(v);
         2
     } else {
-        out.extend_from_slice(&length.to_le_bytes());
+        out.u64_le(length);
         3
     };
     out.extend_from_slice(bytes);
@@ -256,141 +264,119 @@ fn write_container(members: &[Element], out: &mut Vec<u8>, element_type: u8) -> 
     element_type
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+/// Where a refused read stopped: codec's cursor does not move on a refusal,
+/// so its position is the offset the bytes ran out at.
+fn refused(at: usize) -> impl FnOnce(CodecError) -> TlvError {
+    move |error| TlvError::new(at, error.message)
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, count: usize) -> Result<&'a [u8], TlvError> {
-        let end = self.at.checked_add(count).ok_or_else(|| {
-            TlvError::new(self.at, format!("a length of {count} bytes overflows"))
-        })?;
-        let slice = self.bytes.get(self.at..end).ok_or_else(|| {
-            TlvError::new(
-                self.at,
-                format!(
-                    "{count} bytes wanted, {} remain",
-                    self.bytes.len() - self.at
-                ),
+/// `width` little-endian bytes, zero-extended.
+fn unsigned(cursor: &mut Cursor<'_>, width: usize) -> Result<u64, TlvError> {
+    let mut buffer = [0u8; 8];
+    buffer[..width].copy_from_slice(cursor.take(width).map_err(refused(cursor.position()))?);
+    Ok(u64::from_le_bytes(buffer))
+}
+
+/// `width` little-endian bytes, sign-extended.
+fn signed(cursor: &mut Cursor<'_>, width: usize) -> Result<i64, TlvError> {
+    let bytes = cursor.take(width).map_err(refused(cursor.position()))?;
+    let fill = if bytes.last().is_some_and(|b| b & 0x80 != 0) {
+        0xFF
+    } else {
+        0x00
+    };
+    let mut buffer = [fill; 8];
+    buffer[..width].copy_from_slice(bytes);
+    Ok(i64::from_le_bytes(buffer))
+}
+
+/// The element at the cursor; `None` is an end-of-container.
+fn element(cursor: &mut Cursor<'_>) -> Result<Option<Element>, TlvError> {
+    let start = cursor.position();
+    let control = cursor.byte().map_err(refused(start))?;
+    if control == END_OF_CONTAINER {
+        return Ok(None);
+    }
+    let tag = tag(cursor, control >> 5)?;
+    let element_type = control & 0x1F;
+    let value = match element_type {
+        0x00..=0x03 => Value::Signed(signed(cursor, 1 << element_type)?),
+        0x04..=0x07 => Value::Unsigned(unsigned(cursor, 1 << (element_type - 4))?),
+        0x08 => Value::Bool(false),
+        0x09 => Value::Bool(true),
+        0x0A => Value::Float(cursor.f32_le().map_err(refused(cursor.position()))?),
+        0x0B => Value::Double(cursor.f64_le().map_err(refused(cursor.position()))?),
+        0x0C..=0x0F => {
+            let at = cursor.position();
+            let bytes = string(cursor, 1 << (element_type - 0x0C))?;
+            Value::Utf8(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| TlvError::new(at, "the string is not UTF-8"))?,
             )
-        })?;
-        self.at = end;
-        Ok(slice)
-    }
-
-    fn word<const N: usize>(&mut self) -> Result<[u8; N], TlvError> {
-        let mut buffer = [0u8; N];
-        buffer.copy_from_slice(self.take(N)?);
-        Ok(buffer)
-    }
-
-    fn unsigned(&mut self, width: usize) -> Result<u64, TlvError> {
-        let mut buffer = [0u8; 8];
-        buffer[..width].copy_from_slice(self.take(width)?);
-        Ok(u64::from_le_bytes(buffer))
-    }
-
-    /// `width` bytes, sign-extended.
-    fn signed(&mut self, width: usize) -> Result<i64, TlvError> {
-        let bytes = self.take(width)?;
-        let fill = if bytes.last().is_some_and(|b| b & 0x80 != 0) {
-            0xFF
-        } else {
-            0x00
-        };
-        let mut buffer = [fill; 8];
-        buffer[..width].copy_from_slice(bytes);
-        Ok(i64::from_le_bytes(buffer))
-    }
-
-    /// `None` is an end-of-container.
-    fn element(&mut self) -> Result<Option<Element>, TlvError> {
-        let start = self.at;
-        let control = self.take(1)?[0];
-        if control == END_OF_CONTAINER {
-            return Ok(None);
         }
-        let tag = self.tag(control >> 5)?;
-        let element_type = control & 0x1F;
-        let value = match element_type {
-            0x00..=0x03 => Value::Signed(self.signed(1 << element_type)?),
-            0x04..=0x07 => Value::Unsigned(self.unsigned(1 << (element_type - 4))?),
-            0x08 => Value::Bool(false),
-            0x09 => Value::Bool(true),
-            0x0A => Value::Float(f32::from_le_bytes(self.word()?)),
-            0x0B => Value::Double(f64::from_le_bytes(self.word()?)),
-            0x0C..=0x0F => {
-                let at = self.at;
-                let bytes = self.string(1 << (element_type - 0x0C))?;
-                Value::Utf8(
-                    String::from_utf8(bytes.to_vec())
-                        .map_err(|_| TlvError::new(at, "the string is not UTF-8"))?,
-                )
-            }
-            0x10..=0x13 => Value::Octets(self.string(1 << (element_type - 0x10))?.to_vec()),
-            0x14 => Value::Null,
-            0x15 => Value::Structure(self.container(start)?),
-            0x16 => Value::Array(self.container(start)?),
-            0x17 => Value::List(self.container(start)?),
-            other => {
-                return Err(TlvError::new(
-                    start,
-                    format!("element type 0x{other:02X} is not defined"),
-                ));
-            }
-        };
-        Ok(Some(Element { tag, value }))
-    }
+        0x10..=0x13 => Value::Octets(string(cursor, 1 << (element_type - 0x10))?.to_vec()),
+        0x14 => Value::Null,
+        0x15 => Value::Structure(container(cursor, start)?),
+        0x16 => Value::Array(container(cursor, start)?),
+        0x17 => Value::List(container(cursor, start)?),
+        other => {
+            return Err(TlvError::new(
+                start,
+                format!("element type 0x{other:02X} is not defined"),
+            ));
+        }
+    };
+    Ok(Some(Element { tag, value }))
+}
 
-    fn tag(&mut self, control: u8) -> Result<Tag, TlvError> {
-        Ok(match control {
-            0 => Tag::Anonymous,
-            1 => Tag::Context(self.take(1)?[0]),
-            2 => Tag::Common(self.number(2)?),
-            3 => Tag::Common(self.number(4)?),
-            4 => Tag::Implicit(self.number(2)?),
-            5 => Tag::Implicit(self.number(4)?),
-            wide => {
-                let vendor = u16::from_le_bytes(self.word()?);
-                let profile = u16::from_le_bytes(self.word()?);
-                let number = self.number(if wide == 6 { 2 } else { 4 })?;
-                Tag::FullyQualified {
-                    vendor,
-                    profile,
-                    number,
-                }
+fn tag(cursor: &mut Cursor<'_>, control: u8) -> Result<Tag, TlvError> {
+    Ok(match control {
+        0 => Tag::Anonymous,
+        1 => Tag::Context(cursor.byte().map_err(refused(cursor.position()))?),
+        2 => Tag::Common(number(cursor, 2)?),
+        3 => Tag::Common(number(cursor, 4)?),
+        4 => Tag::Implicit(number(cursor, 2)?),
+        5 => Tag::Implicit(number(cursor, 4)?),
+        wide => {
+            let vendor = cursor.u16_le().map_err(refused(cursor.position()))?;
+            let profile = cursor.u16_le().map_err(refused(cursor.position()))?;
+            let number = number(cursor, if wide == 6 { 2 } else { 4 })?;
+            Tag::FullyQualified {
+                vendor,
+                profile,
+                number,
             }
-        })
-    }
+        }
+    })
+}
 
-    /// A tag number of two or four bytes.
-    fn number(&mut self, width: usize) -> Result<u32, TlvError> {
-        let at = self.at;
-        u32::try_from(self.unsigned(width)?)
-            .map_err(|_| TlvError::new(at, "a tag number wider than four bytes"))
-    }
+/// A tag number of two or four bytes.
+fn number(cursor: &mut Cursor<'_>, width: usize) -> Result<u32, TlvError> {
+    let at = cursor.position();
+    u32::try_from(unsigned(cursor, width)?)
+        .map_err(|_| TlvError::new(at, "a tag number wider than four bytes"))
+}
 
-    fn string(&mut self, width: usize) -> Result<&'a [u8], TlvError> {
-        let at = self.at;
-        let length = usize::try_from(self.unsigned(width)?)
-            .map_err(|_| TlvError::new(at, "the length does not fit this machine"))?;
-        self.take(length)
-    }
+/// A length of `width` bytes, then that many bytes.
+fn string<'a>(cursor: &mut Cursor<'a>, width: usize) -> Result<&'a [u8], TlvError> {
+    let at = cursor.position();
+    let length = usize::try_from(unsigned(cursor, width)?)
+        .map_err(|_| TlvError::new(at, "the length does not fit this machine"))?;
+    cursor.take(length).map_err(refused(cursor.position()))
+}
 
-    fn container(&mut self, opened_at: usize) -> Result<Vec<Element>, TlvError> {
-        let mut members = Vec::new();
-        loop {
-            if self.at >= self.bytes.len() {
-                return Err(TlvError::new(
-                    opened_at,
-                    "the container opened here is never closed",
-                ));
-            }
-            match self.element()? {
-                Some(member) => members.push(member),
-                None => return Ok(members),
-            }
+fn container(cursor: &mut Cursor<'_>, opened_at: usize) -> Result<Vec<Element>, TlvError> {
+    let mut members = Vec::new();
+    loop {
+        if cursor.is_empty() {
+            return Err(TlvError::new(
+                opened_at,
+                "the container opened here is never closed",
+            ));
+        }
+        match element(cursor)? {
+            Some(member) => members.push(member),
+            None => return Ok(members),
         }
     }
 }
@@ -480,7 +466,13 @@ mod tests {
     #[test]
     fn a_length_past_the_end_is_refused_where_the_bytes_run_out() {
         let refused = decode(&[0x30, 0x01, 0x09, 0xAA, 0xBB]);
-        assert_eq!(refused, Err(TlvError::new(3, "9 bytes wanted, 2 remain")));
+        assert_eq!(
+            refused,
+            Err(TlvError::new(
+                3,
+                "a field of 9 bytes runs past the end, 2 remain"
+            ))
+        );
         assert_eq!(
             decode(&[0x04, 0x01, 0x04, 0x02]),
             Err(TlvError::new(2, "bytes continue past the element"))
