@@ -347,6 +347,7 @@ impl Logic for Matter {
             },
         };
         Ok(Reply {
+            trailers: Vec::new(),
             headers: headers(INVOKE_RESPONSE_OPCODE),
             body: message(&invocation.arguments, InvokeResponse::of(answer).encode()),
         })
@@ -535,6 +536,7 @@ mod tests {
             }]
         );
         let reply_of = |answer: Answer| Reply {
+            trailers: Vec::new(),
             headers: Vec::new(),
             body: stream(InvokeResponse::of(answer).encode()),
         };
