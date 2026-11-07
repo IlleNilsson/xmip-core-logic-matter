@@ -397,6 +397,7 @@ impl Logic for Matter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use tlv::Tag;
     use xcore::StreamId;
 
@@ -488,12 +489,12 @@ mod tests {
             })
         );
         let success = answered(&Outcome::Result(stream(Vec::new())));
-        assert!(matches!(success, Answer::Status { status, .. } if status.is_success()));
+        assert_matches!(success, Answer::Status { status, .. } if status.is_success());
         let general = answered(&Outcome::Fault(Fault {
             code: "UNSUPPORTED_COMMAND".into(),
             message: String::new(),
         }));
-        assert!(matches!(general, Answer::Status { status, .. } if status.general == 0x81));
+        assert_matches!(general, Answer::Status { status, .. } if status.general == 0x81);
         let specific = answered(&Outcome::Fault(Fault {
             code: "FAILURE/0x02".into(),
             message: String::new(),
@@ -502,7 +503,7 @@ mod tests {
             general: Status::FAILURE,
             cluster: Some(2),
         };
-        assert!(matches!(specific, Answer::Status { status, .. } if status == expected));
+        assert_matches!(specific, Answer::Status { status, .. } if status == expected);
         let unknown = Outcome::Fault(Fault {
             code: "TEAPOT".into(),
             message: String::new(),
