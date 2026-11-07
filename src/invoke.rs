@@ -351,6 +351,7 @@ fn read_answer(element: &Element) -> Result<Answer, InvokeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     const TOGGLE: CommandPath = CommandPath {
         endpoint: 1,
@@ -436,14 +437,11 @@ mod tests {
 
     #[test]
     fn what_is_not_an_invoke_message_is_refused_with_the_reason() {
-        assert!(matches!(
-            InvokeRequest::decode(&[0x15]),
-            Err(InvokeError::Tlv(_))
-        ));
-        assert!(matches!(
+        assert_matches!(InvokeRequest::decode(&[0x15]), Err(InvokeError::Tlv(_)));
+        assert_matches!(
             InvokeResponse::decode(&[0x04, 0x01]),
             Err(InvokeError::Shape(_))
-        ));
+        );
         let no_path = tlv::encode(&Element::new(
             Tag::Anonymous,
             Value::Structure(vec![
