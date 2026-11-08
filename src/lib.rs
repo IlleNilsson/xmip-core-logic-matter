@@ -240,7 +240,7 @@ fn fields_of(stream: &Stream) -> Result<Option<Element>, LogicError> {
     if stream.is_empty() {
         return Ok(None);
     }
-    let fields = tlv::decode(stream.bytes())
+    let fields = tlv::decode(stream.load()?)
         .map_err(|error| LogicError::new(format!("the fields are not TLV: {error}")))?;
     match fields.value {
         Value::Structure(_) => Ok(Some(fields)),
@@ -305,7 +305,7 @@ impl Logic for Matter {
     }
 
     fn invocation(&self, arrival: &Arrival<'_>) -> Result<Invocation, LogicError> {
-        let request = InvokeRequest::decode(arrival.body.bytes())
+        let request = InvokeRequest::decode(arrival.body.load()?)
             .map_err(|error| LogicError::new(format!("not an invoke request: {error}")))?;
         let [command] = request.commands.as_slice() else {
             return Err(LogicError::new(format!(
@@ -376,7 +376,7 @@ impl Logic for Matter {
     }
 
     fn outcome(&self, invocation: &Invocation, reply: &Reply) -> Result<Outcome, LogicError> {
-        let response = InvokeResponse::decode(reply.body.bytes())
+        let response = InvokeResponse::decode(reply.body.load()?)
             .map_err(|error| LogicError::new(format!("not an invoke response: {error}")))?;
         let answer = response
             .answers
@@ -441,7 +441,10 @@ mod tests {
             invocation.operation,
             OperationName::new("LevelControl", "MoveToLevel")
         );
-        assert_eq!(invocation.arguments.bytes(), tlv::encode(&level()));
+        assert_eq!(
+            invocation.arguments.load().expect("held"),
+            tlv::encode(&level())
+        );
         assert_eq!(invocation.arguments.media_type(), Some(MEDIA_TYPE));
         assert_eq!(
             invocation.parameters,
@@ -476,7 +479,8 @@ mod tests {
         let answered = |outcome: &Outcome| {
             let reply = Matter.reply(&invocation, outcome).expect("reply");
             assert!(reply.headers.contains(&Header::new(OPCODE_HEADER, "9")));
-            let response = InvokeResponse::decode(reply.body.bytes()).expect("decode");
+            let response =
+                InvokeResponse::decode(reply.body.load().expect("held")).expect("decode");
             response.answers.into_iter().next().expect("one answer")
         };
         let fields = answered(&Outcome::Result(stream(tlv::encode(&level()))));
@@ -523,7 +527,7 @@ mod tests {
         assert_eq!(request.target, "2/OnOff/Toggle");
         assert_eq!(request.method, "invoke");
         assert!(request.headers.contains(&Header::new(OPCODE_HEADER, "8")));
-        let decoded = InvokeRequest::decode(request.body.bytes()).expect("decode");
+        let decoded = InvokeRequest::decode(request.body.load().expect("held")).expect("decode");
         assert_eq!(
             decoded.commands,
             vec![CommandData {
@@ -556,7 +560,9 @@ mod tests {
             command_ref: None,
         }));
         match Matter.outcome(&invocation, &answered).expect("outcome") {
-            Outcome::Result(result) => assert_eq!(result.bytes(), tlv::encode(&level())),
+            Outcome::Result(result) => {
+                assert_eq!(result.load().expect("held"), tlv::encode(&level()));
+            }
             Outcome::Fault(fault) => panic!("unexpected {fault:?}"),
         }
         let refused = reply_of(Answer::Status {
