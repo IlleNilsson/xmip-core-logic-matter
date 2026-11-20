@@ -231,7 +231,7 @@ fn parameters_of(command: &CommandData, request: &InvokeRequest) -> Vec<Header> 
 
 /// Command fields as a Stream: the structure's bytes, or none.
 fn stream_of(model: &Stream, fields: Option<&Element>) -> Stream {
-    let bytes = fields.map(tlv::encode).unwrap_or_default();
+    let bytes = fields.map_or_default(tlv::encode);
     Stream::new(model.id(), bytes, Some(MEDIA_TYPE.to_string()))
 }
 
